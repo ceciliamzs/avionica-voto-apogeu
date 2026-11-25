@@ -2,128 +2,207 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
 
-// definição dos pinos
-#define PIN_SAIDA_VOTO 8        // Pino digital que vai para o circuito de votação/MOSFET
-#define PIN_LED_STATUS 13       // LED onboard para indicação visual
+// --- IDENTIFICACAO DO NO E PINOS ---
+const char* ID_JURADO = "JURADO_C"; // Teste inicial como entrada C (via level shifter 3.3V -> 5V)
+#define PIN_SAIDA_VOTO 8            // Pino digital do jurado -> LV (3.3V) do conversor -> HV (5V) entrada C
+#define PIN_LED_STATUS 13           // LED onboard (ou externo) de status
 
-// instância do sensor barométrico
+// --- CONFIGURACAO DO SENSOR E VOO ---
 Adafruit_BMP280 bmp;
 
-// constantes de calibração e voo
-#define PRESSAO_MAR_PADRAO 1013.25 // hPa (será calibrado no solo)
-#define LIMIAR_SUBIDA_INICIAL 3.0  // Altitude mínima (metros) para considerar que o foguete decolou
-#define AMOSTRAS_HISTORICO 5       // Número de pontos para suavização e tendência
+#define PRESSAO_MAR_PADRAO 1013.25 // hPa (usado apenas na formula barometrica)
+#define LIMIAR_SUBIDA_INICIAL 3.0  // Ganho minimo (m) em relacao a base para sair de SOLO
+#define ALTITUDE_MIN_APOGEU 10.0   // Altitude minima (m) para validar apogeu
+#define MARGEM_QUEDA_APOGEU 0.5    // Queda minima (m) entre media antiga e recente
+#define AMOSTRAS_HISTORICO 6       // Par: 3 amostras antigas vs 3 amostras recentes
 
-// variáveis de controle de estado
+// --- MODO DE TESTE NO SERIAL MONITOR ---
+const bool MODO_DEBUG_SERIAL = true;
+
 enum EstadosVoo {
   ESTADO_SOLO = 0,
   ESTADO_SUBIDA,
   ESTADO_APOGEU_DETECTADO
 };
-EstadosVoo estadoAtual = ESTADO_SOLO;
 
-// variáveis de altitude e tempo
+EstadosVoo estadoAtual = ESTADO_SOLO;
+bool votoConfirmado = false;
+
 float altitudeBase = 0.0;
 float historicoAltitudes[AMOSTRAS_HISTORICO];
-int indiceHistorico = 0;
+int indiceEscrita = 0;
+
 unsigned long ultimoTempoLeitura = 0;
-const unsigned long intervaloLeitura = 50; // leitura a cada 50ms (20 Hz)
+const unsigned long intervaloLeitura = 50; // 50 ms = 20 Hz
+unsigned long ultimoTempoPisca = 0;
+
+float obterAltitudeCronologica(int posCronologica) {
+  int indiceReal = (indiceEscrita + posCronologica) % AMOSTRAS_HISTORICO;
+  return historicoAltitudes[indiceReal];
+}
+
+const char* nomeEstado(EstadosVoo estado) {
+  switch (estado) {
+    case ESTADO_SOLO: return "SOLO";
+    case ESTADO_SUBIDA: return "SUBIDA";
+    case ESTADO_APOGEU_DETECTADO: return "APOGEU_DETECTADO";
+    default: return "DESCONHECIDO";
+  }
+}
+
+void definirVoto(bool votar) {
+  votoConfirmado = votar;
+  digitalWrite(PIN_SAIDA_VOTO, votar ? HIGH : LOW);
+}
+
+void imprimirCabecalhoSerial() {
+  Serial.println(F("=========================================================================="));
+  Serial.print(F("TESTE "));
+  Serial.print(ID_JURADO);
+  Serial.println(F(" (BMP280 + PRO MINI -> LEVEL SHIFTER -> VOTACAO 5V [ENTRADA C])"));
+  Serial.println(F("Tempo(ms) | Jurado   | Estado           | AltRel(m) | MedAnt | MedRec | VotoC"));
+  Serial.println(F("=========================================================================="));
+}
 
 void setup() {
   pinMode(PIN_SAIDA_VOTO, OUTPUT);
   pinMode(PIN_LED_STATUS, OUTPUT);
-  digitalWrite(PIN_SAIDA_VOTO, LOW); // garante que inicia desarmado/sem votar
+
+  // Garante saida em LOW antes de qualquer inicializacao
+  definirVoto(false);
   digitalWrite(PIN_LED_STATUS, LOW);
 
-  Serial.begin(9600);
+  Serial.begin(115200);
+  delay(500);
+  Serial.print(F("\nInicializando "));
+  Serial.print(ID_JURADO);
+  Serial.println(F("..."));
 
-  // inicializa o barômetro (endereço I2C padrão 0x76 ou 0x77)
-  if (!bmp.begin(0x76)) {
-    Serial.println(F("Erro ao encontrar o sensor BMP280! Verifique as conexões."));
+  bool sensorOk = bmp.begin(0x76);
+  uint8_t enderecoUsado = 0x76;
+
+  if (!sensorOk) {
+    Serial.println(F("Aviso: BMP280 nao encontrado em 0x76. Tentando 0x77..."));
+    sensorOk = bmp.begin(0x77);
+    enderecoUsado = 0x77;
+  }
+
+  if (!sensorOk) {
+    Serial.println(F("ERRO CRITICO: BMP280 nao encontrado em 0x76 nem 0x77!"));
+    definirVoto(false);
     while (1) {
       digitalWrite(PIN_LED_STATUS, !digitalRead(PIN_LED_STATUS));
-      delay(200); // pisca rápido se o sensor falhar
+      delay(200);
     }
   }
 
-  // configuração recomendada para modo de voo (alta precisão e filtro)
-  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     // modo contínuo
-                  Adafruit_BMP280::SAMPLING_X2,     // oversampling de temperatura
-                  Adafruit_BMP280::SAMPLING_X16,    // oversampling de pressão
-                  Adafruit_BMP280::FILTER_X4,       // filtro IIR interno contra ruídos
+  Serial.print(F("BMP280 conectado no endereco I2C 0x"));
+  Serial.println(enderecoUsado, HEX);
+
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                  Adafruit_BMP280::SAMPLING_X2,
+                  Adafruit_BMP280::SAMPLING_X16,
+                  Adafruit_BMP280::FILTER_X4,
                   Adafruit_BMP280::STANDBY_MS_55);
 
-  // calibração inicial no solo (média de leituras para zerar a altitude base)
-  float somaPressao = 0;
+  Serial.println(F("Calibrando altitude base no solo (20 amostras)..."));
+  double somaPressaoPa = 0.0;
   for (int i = 0; i < 20; i++) {
-    somaPressao += bmp.readPressure();
+    somaPressaoPa += bmp.readPressure();
     delay(25);
   }
-  float pressaoSoloMedia = somaPressao / 20.0;
-  altitudeBase = bmp.readAltitude(pressaoSoloMedia / 100.0);
 
-  // preenche o histórico inicial com a altitude de solo
+  float pressaoSoloHpa = (somaPressaoPa / 20.0) / 100.0;
+  altitudeBase = 44330.0 * (1.0 - pow(pressaoSoloHpa / PRESSAO_MAR_PADRAO, 0.1903));
+
   for (int i = 0; i < AMOSTRAS_HISTORICO; i++) {
-    historicoAltitudes[i] = altitudeBase;
+    historicoAltitudes[i] = 0.0;
   }
+  indiceEscrita = 0;
+
+  Serial.print(F("Pressao base: "));
+  Serial.print(pressaoSoloHpa, 2);
+  Serial.print(F(" hPa | Altitude base ref: "));
+  Serial.print(altitudeBase, 2);
+  Serial.println(F(" m"));
+  Serial.println(F("VotoC inicial: LOW (0)"));
+  imprimirCabecalhoSerial();
 }
 
 void loop() {
   unsigned long tempoAtual = millis();
 
-  // executa a leitura e a lógica na taxa definida (ex: 20Hz)
   if (tempoAtual - ultimoTempoLeitura >= intervaloLeitura) {
     ultimoTempoLeitura = tempoAtual;
 
-    // leitura da altitude atual em relação ao nível do mar convertida para a base
-    float pressaoAtual = bmp.readPressure() / 100.0; // converte para hPa
-    float altitudeAtual = bmp.readAltitude(PRESSAO_MAR_PADRAO) - altitudeBase;
+    float pressaoHpa = bmp.readPressure() / 100.0;
+    float altitudeAbsoluta = 44330.0 * (1.0 - pow(pressaoHpa / PRESSAO_MAR_PADRAO, 0.1903));
+    float altitudeRelativa = altitudeAbsoluta - altitudeBase;
 
-    // atualiza o buffer circular do histórico
-    historicoAltitudes[indiceHistorico] = altitudeAtual;
-    indiceHistorico = (indiceHistorico + 1) % AMOSTRAS_HISTORICO;
+    historicoAltitudes[indiceEscrita] = altitudeRelativa;
+    indiceEscrita = (indiceEscrita + 1) % AMOSTRAS_HISTORICO;
 
-    // executa a Máquina de Estados do Voo
-    switch (estadoAtual) {
-      
-      case ESTADO_SOLO:
-        // se a altitude subir mais que o limiar mínimo, consideramos que o foguete decolou
-        if (altitudeAtual > LIMIAR_SUBIDA_INICIAL) {
-          estadoAtual = ESTADO_SUBIDA;
-          digitalWrite(PIN_LED_STATUS, HIGH); // LED aceso indica voo detectado
-        }
-        break;
+    int metade = AMOSTRAS_HISTORICO / 2;
+    float somaAntiga = 0.0;
+    float somaRecente = 0.0;
 
-      case ESTADO_SUBIDA: {
-        
-        float mediaRecente = 0;
-        float mediaAntiga = 0;
-        
-        int metade = AMOSTRAS_HISTORICO / 2;
-        for (int i = 0; i < AMOSTRAS_HISTORICO; i++) {
-          int idx = (indiceHistorico + i) % AMOSTRAS_HISTORICO;
-          if (i < metade) {
-            mediaAntiga += historicoAltitudes[idx];
-          } else {
-            mediaRecente += historicoAltitudes[idx];
-          }
-        }
-        mediaAntiga = mediaAntiga / metade;
-        mediaRecente = mediaRecente / (AMOSTRAS_HISTORICO - metade);
+    for (int i = 0; i < metade; i++) {
+      somaAntiga += obterAltitudeCronologica(i);
+    }
+    for (int i = metade; i < AMOSTRAS_HISTORICO; i++) {
+      somaRecente += obterAltitudeCronologica(i);
+    }
 
-        if ((mediaRecente < mediaAntiga) && (altitudeAtual > 10.0)) {
-          estadoAtual = ESTADO_APOGEU_DETECTADO;
-          
-          // joga o pino em HIGH para sinalizar apogeu
-          digitalWrite(PIN_SAIDA_VOTO, HIGH); 
-        }
-        break;
+    float mediaAntiga = somaAntiga / metade;
+    float mediaRecente = somaRecente / (AMOSTRAS_HISTORICO - metade);
+
+    if (estadoAtual == ESTADO_SOLO) {
+      definirVoto(false);
+      digitalWrite(PIN_LED_STATUS, LOW);
+
+      if (altitudeRelativa > LIMIAR_SUBIDA_INICIAL) {
+        estadoAtual = ESTADO_SUBIDA;
+        digitalWrite(PIN_LED_STATUS, HIGH);
+        Serial.print(F(">>> ["));
+        Serial.print(ID_JURADO);
+        Serial.println(F("] TRANSICAO: SOLO -> SUBIDA <<<"));
       }
+    }
+    else if (estadoAtual == ESTADO_SUBIDA) {
+      bool quedaConfirmada = (mediaAntiga - mediaRecente) >= MARGEM_QUEDA_APOGEU;
+      bool acimaDoMinimo = (altitudeRelativa >= ALTITUDE_MIN_APOGEU);
 
-      case ESTADO_APOGEU_DETECTADO:
-        // mantém o voto ativo. pode travar aqui até o reset físico.
-        digitalWrite(PIN_LED_STATUS, !digitalRead(PIN_LED_STATUS)); // pisca indicando evento disparado
-        break;
+      if (quedaConfirmada && acimaDoMinimo) {
+        estadoAtual = ESTADO_APOGEU_DETECTADO;
+        definirVoto(true);
+        Serial.print(F(">>> ["));
+        Serial.print(ID_JURADO);
+        Serial.println(F("] TRANSICAO: SUBIDA -> APOGEU_DETECTADO (VotoC = HIGH) <<<"));
+      }
+    }
+    else if (estadoAtual == ESTADO_APOGEU_DETECTADO) {
+      definirVoto(true);
+
+      if (tempoAtual - ultimoTempoPisca >= 150) {
+        ultimoTempoPisca = tempoAtual;
+        digitalWrite(PIN_LED_STATUS, !digitalRead(PIN_LED_STATUS));
+      }
+    }
+
+    if (MODO_DEBUG_SERIAL) {
+      Serial.print(tempoAtual);
+      Serial.print(F(" | "));
+      Serial.print(ID_JURADO);
+      Serial.print(F(" | "));
+      Serial.print(nomeEstado(estadoAtual));
+      Serial.print(F(" | "));
+      Serial.print(altitudeRelativa, 2);
+      Serial.print(F(" | "));
+      Serial.print(mediaAntiga, 2);
+      Serial.print(F(" | "));
+      Serial.print(mediaRecente, 2);
+      Serial.print(F(" | "));
+      Serial.println(votoConfirmado ? F("HIGH") : F("LOW"));
     }
   }
 }
