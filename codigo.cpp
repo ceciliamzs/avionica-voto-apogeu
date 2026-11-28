@@ -2,10 +2,12 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
 
-// --- IDENTIFICACAO DO NO E PINOS ---
-const char* ID_JURADO = "JURADO_C"; // Teste inicial como entrada C (via level shifter 3.3V -> 5V)
-#define PIN_SAIDA_VOTO 8            // Pino digital do jurado -> LV (3.3V) do conversor -> HV (5V) entrada C
-#define PIN_LED_STATUS 13           // LED onboard (ou externo) de status
+// --- IDENTIFICACAO DO NO E PINOS (ESP32) ---
+const char* ID_JURADO = "JURADO_C"; // Teste inicial como entrada C (3.3V -> LV level shifter -> HV 5V)
+#define PIN_I2C_SDA 21              // SDA padrao da ESP32
+#define PIN_I2C_SCL 22              // SCL padrao da ESP32
+#define PIN_SAIDA_VOTO 25           // Saida digital 3.3V -> LV do conversor -> HV (5V) entrada C
+#define PIN_LED_STATUS 2            // LED onboard comum na ESP32 (ajuste se necessario)
 
 // --- CONFIGURACAO DO SENSOR E VOO ---
 Adafruit_BMP280 bmp;
@@ -27,6 +29,7 @@ enum EstadosVoo {
 
 EstadosVoo estadoAtual = ESTADO_SOLO;
 bool votoConfirmado = false;
+bool estadoLed = false;
 
 float altitudeBase = 0.0;
 float historicoAltitudes[AMOSTRAS_HISTORICO];
@@ -55,11 +58,16 @@ void definirVoto(bool votar) {
   digitalWrite(PIN_SAIDA_VOTO, votar ? HIGH : LOW);
 }
 
+void setLedStatus(bool ligado) {
+  estadoLed = ligado;
+  digitalWrite(PIN_LED_STATUS, estadoLed ? HIGH : LOW);
+}
+
 void imprimirCabecalhoSerial() {
   Serial.println(F("=========================================================================="));
   Serial.print(F("TESTE "));
   Serial.print(ID_JURADO);
-  Serial.println(F(" (BMP280 + PRO MINI -> LEVEL SHIFTER -> VOTACAO 5V [ENTRADA C])"));
+  Serial.println(F(" (BMP280 + ESP32 [SDA 21 / SCL 22] -> LEVEL SHIFTER -> VOTACAO 5V [ENTRADA C])"));
   Serial.println(F("Tempo(ms) | Jurado   | Estado           | AltRel(m) | MedAnt | MedRec | VotoC"));
   Serial.println(F("=========================================================================="));
 }
@@ -70,13 +78,16 @@ void setup() {
 
   // Garante saida em LOW antes de qualquer inicializacao
   definirVoto(false);
-  digitalWrite(PIN_LED_STATUS, LOW);
+  setLedStatus(false);
 
   Serial.begin(115200);
   delay(500);
   Serial.print(F("\nInicializando "));
   Serial.print(ID_JURADO);
-  Serial.println(F("..."));
+  Serial.println(F(" na ESP32..."));
+
+  // Inicializa o barramento I2C nos pinos 21 (SDA) e 22 (SCL)
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
   bool sensorOk = bmp.begin(0x76);
   uint8_t enderecoUsado = 0x76;
@@ -91,7 +102,7 @@ void setup() {
     Serial.println(F("ERRO CRITICO: BMP280 nao encontrado em 0x76 nem 0x77!"));
     definirVoto(false);
     while (1) {
-      digitalWrite(PIN_LED_STATUS, !digitalRead(PIN_LED_STATUS));
+      setLedStatus(!estadoLed);
       delay(200);
     }
   }
@@ -158,11 +169,11 @@ void loop() {
 
     if (estadoAtual == ESTADO_SOLO) {
       definirVoto(false);
-      digitalWrite(PIN_LED_STATUS, LOW);
+      setLedStatus(false);
 
       if (altitudeRelativa > LIMIAR_SUBIDA_INICIAL) {
         estadoAtual = ESTADO_SUBIDA;
-        digitalWrite(PIN_LED_STATUS, HIGH);
+        setLedStatus(true);
         Serial.print(F(">>> ["));
         Serial.print(ID_JURADO);
         Serial.println(F("] TRANSICAO: SOLO -> SUBIDA <<<"));
@@ -185,7 +196,7 @@ void loop() {
 
       if (tempoAtual - ultimoTempoPisca >= 150) {
         ultimoTempoPisca = tempoAtual;
-        digitalWrite(PIN_LED_STATUS, !digitalRead(PIN_LED_STATUS));
+        setLedStatus(!estadoLed);
       }
     }
 
