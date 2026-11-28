@@ -39,7 +39,7 @@ Adafruit_BMP280 bmp;
 #define PRESSAO_MAR_PADRAO 1013.25   // hPa (usado apenas na formula barometrica)
 #define LIMIAR_SUBIDA_INICIAL 3.0    // Ganho minimo (m) em relacao a base para sair de SOLO
 #define VEL_DECOLAGEM 5.0            // Velocidade vertical minima (m/s) para sair de SOLO
-#define ALTITUDE_MIN_APOGEU 10.0     // Altitude minima (m) para validar apogeu
+#define ALTITUDE_MIN_APOGEU 500.0     // Altitude minima (m) para validar apogeu
 #define MARGEM_QUEDA_APOGEU 0.5      // Queda minima (m) entre media antiga e recente
 #define AMOSTRAS_HISTORICO 6         // Par: 3 amostras antigas vs 3 amostras recentes
 #define CONFIRMACOES_APOGEU 3        // Leituras seguidas com queda confirmada para votar
